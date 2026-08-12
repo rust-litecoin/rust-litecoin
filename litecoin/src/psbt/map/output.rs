@@ -6,6 +6,7 @@ use crate::bip32::KeySource;
 use crate::blockdata::script::ScriptBuf;
 use crate::prelude::*;
 use crate::psbt::map::Map;
+use crate::psbt::mweb::{self, types::*};
 use crate::psbt::{raw, Error};
 use crate::taproot::{TapLeafHash, TapTree};
 
@@ -51,6 +52,8 @@ pub struct Output {
     /// Unknown key-value pairs for this output.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq_byte_values"))]
     pub unknown: BTreeMap<raw::Key, Vec<u8>>,
+    /// MWEB fields for this output (`0x90`..=`0x98`, empty key).
+    pub mweb: mweb::MwebOutput,
 }
 
 impl Output {
@@ -97,6 +100,12 @@ impl Output {
                     self.tap_key_origins <= <raw_key: XOnlyPublicKey>|< raw_value: (Vec<TapLeafHash>, KeySource)>
                 }
             }
+            ty if (MWEB_OUTPUT_FIELD_MIN..=MWEB_OUTPUT_FIELD_MAX).contains(&ty) => {
+                if !raw_key.key.is_empty() {
+                    return Err(Error::InvalidKey(raw_key));
+                }
+                self.mweb.apply_field(ty, &raw_value);
+            }
             _ => match self.unknown.entry(raw_key) {
                 btree_map::Entry::Vacant(empty_key) => {
                     empty_key.insert(raw_value);
@@ -114,6 +123,7 @@ impl Output {
         self.proprietary.extend(other.proprietary);
         self.unknown.extend(other.unknown);
         self.tap_key_origins.extend(other.tap_key_origins);
+        self.mweb.combine(other.mweb);
 
         combine!(redeem_script, self, other);
         combine!(witness_script, self, other);
@@ -148,6 +158,13 @@ impl Map for Output {
 
         impl_psbt_get_pair! {
             rv.push_map(self.tap_key_origins, PSBT_OUT_TAP_BIP32_DERIVATION)
+        }
+
+        for (field_ty, value) in self.mweb.to_pairs() {
+            rv.push(raw::Pair {
+                key: raw::Key { type_value: field_ty, key: vec![] },
+                value,
+            });
         }
 
         for (key, value) in self.proprietary.iter() {

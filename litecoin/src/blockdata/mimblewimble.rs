@@ -227,6 +227,10 @@ impl Decodable for PegOutCoin {
     ) -> Result<Self, encode::Error> {
         let amount = read_amount(r)?;
         let script_pub_key = ScriptBuf::consensus_decode_from_finite_reader(r)?;
+        // Mirror Litecoin Core PegOutCoin Unserialize: empty destinations are invalid on the wire.
+        if script_pub_key.is_empty() {
+            return Err(encode::Error::ParseFailed("Pegout scriptPubKey must not be empty"));
+        }
         Ok(PegOutCoin { amount, script_pub_key })
     }
 }
@@ -595,6 +599,18 @@ mod tests {
         let encoded = serialize(&coin);
         let decoded: PegOutCoin = deserialize(&encoded).unwrap();
         assert_eq!(coin, decoded);
+    }
+
+    #[test]
+    fn pegout_coin_empty_script_rejected() {
+        // amount varint=1, then Bitcoin CompactSize script length 0 (Core rejects on read).
+        let buf = vec![0x01, 0x00];
+        match deserialize::<PegOutCoin>(&buf) {
+            Err(encode::Error::ParseFailed(msg)) => {
+                assert_eq!(msg, "Pegout scriptPubKey must not be empty")
+            }
+            other => panic!("expected ParseFailed, got {other:?}"),
+        }
     }
 
     #[test]

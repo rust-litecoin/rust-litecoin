@@ -1,3 +1,10 @@
+# 0.32.8-rc.2 - 2026-07-27
+
+- PSBT: first-class typed MWEB maps (`0x90+`) for global offsets, kernels, and input/output
+  fields; [`Psbt::extract_tx_with_mweb`] assembles `mw_tx` at extract time
+- PSBT: MWEB BIP32 origins `0x9A`/`0x9B` as `(PublicKey, KeySource)` matching ltcd
+  (`pubkey` key data + BIP174 KeySource value); ltcd inventory + empty-vin extract tests
+
 # 0.32.8 - 2025-11-24
 
 - Backport - bip158: Return no match for empty query [#4972](https://github.com/rust-bitcoin/rust-bitcoin/pull/4972)

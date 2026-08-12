@@ -14,6 +14,7 @@ use crate::crypto::key::PublicKey;
 use crate::crypto::{ecdsa, taproot};
 use crate::prelude::*;
 use crate::psbt::map::Map;
+use crate::psbt::mweb::{self, types::*};
 use crate::psbt::serialize::Deserialize;
 use crate::psbt::{self, error, raw, Error};
 use crate::sighash::{
@@ -130,6 +131,8 @@ pub struct Input {
     /// Unknown key-value pairs for this input.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq_byte_values"))]
     pub unknown: BTreeMap<raw::Key, Vec<u8>>,
+    /// MWEB fields for this input (`0x90`..=`0x9C`, empty key).
+    pub mweb: mweb::MwebInput,
 }
 
 /// A Signature hash type for the corresponding input.
@@ -362,6 +365,19 @@ impl Input {
                     btree_map::Entry::Occupied(_) => return Err(Error::DuplicateKey(raw_key)),
                 }
             }
+            ty if (MWEB_INPUT_FIELD_MIN..=MWEB_INPUT_FIELD_MAX).contains(&ty) => {
+                // ltcd: most MWEB fields use empty key; 0x9A/0x9B use compressed pubkey as key.
+                let is_origin = ty == MWEB_MASTER_SCAN_KEY_ORIGIN_TYPE
+                    || ty == MWEB_MASTER_SPEND_KEY_ORIGIN_TYPE;
+                if is_origin {
+                    if raw_key.key.is_empty() {
+                        return Err(Error::InvalidKey(raw_key));
+                    }
+                } else if !raw_key.key.is_empty() {
+                    return Err(Error::InvalidKey(raw_key));
+                }
+                self.mweb.apply_kv_field(ty, &raw_key.key, &raw_value);
+            }
             _ => match self.unknown.entry(raw_key) {
                 btree_map::Entry::Vacant(empty_key) => {
                     empty_key.insert(raw_value);
@@ -393,6 +409,7 @@ impl Input {
         self.tap_key_origins.extend(other.tap_key_origins);
         self.proprietary.extend(other.proprietary);
         self.unknown.extend(other.unknown);
+        self.mweb.combine(other.mweb);
 
         combine!(redeem_script, self, other);
         combine!(witness_script, self, other);
@@ -483,6 +500,13 @@ impl Map for Input {
         impl_psbt_get_pair! {
             rv.push(self.tap_merkle_root, PSBT_IN_TAP_MERKLE_ROOT)
         }
+        for (field_ty, key_data, value) in self.mweb.to_kv_pairs() {
+            rv.push(raw::Pair {
+                key: raw::Key { type_value: field_ty, key: key_data },
+                value,
+            });
+        }
+
         for (key, value) in self.proprietary.iter() {
             rv.push(raw::Pair { key: key.to_key(), value: value.clone() });
         }

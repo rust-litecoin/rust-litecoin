@@ -8,6 +8,7 @@ use crate::consensus::encode::MAX_VEC_SIZE;
 use crate::consensus::{encode, Decodable};
 use crate::prelude::*;
 use crate::psbt::map::Map;
+use crate::psbt::mweb::{self, types::*};
 use crate::psbt::{raw, Error, Psbt};
 
 /// Type: Unsigned Transaction PSBT_GLOBAL_UNSIGNED_TX = 0x00
@@ -57,6 +58,72 @@ impl Map for Psbt {
             });
         }
 
+        if let Some(off) = self.mweb_tx_offset {
+            rv.push(raw::Pair {
+                key: raw::Key { type_value: MWEB_TX_OFFSET_TYPE, key: vec![] },
+                value: off.to_vec(),
+            });
+        }
+        if let Some(off) = self.mweb_stealth_offset {
+            rv.push(raw::Pair {
+                key: raw::Key { type_value: MWEB_TX_STEALTH_OFFSET_TYPE, key: vec![] },
+                value: off.to_vec(),
+            });
+        }
+        if !self.mweb_kernels.is_empty() {
+            rv.push(raw::Pair {
+                key: raw::Key { type_value: MWEB_KERNEL_COUNT_TYPE, key: vec![] },
+                value: (self.mweb_kernels.len() as u32).to_le_bytes().to_vec(),
+            });
+            for (i, kernel) in self.mweb_kernels.iter().enumerate() {
+                for (field_ty, key_suffix, value) in kernel.to_kv_pairs() {
+                    let mut key = (i as u32).to_le_bytes().to_vec();
+                    key.push(field_ty);
+                    key.extend_from_slice(&key_suffix);
+                    rv.push(raw::Pair {
+                        key: raw::Key {
+                            type_value: MWEB_GLOBAL_KERNEL_FIELD_TYPE,
+                            key,
+                        },
+                        value,
+                    });
+                }
+            }
+        }
+
+        if !self.mweb_inputs.is_empty() {
+            for (i, inp) in self.mweb_inputs.iter().enumerate() {
+                for (field_ty, key_data, value) in inp.to_kv_pairs() {
+                    // Parallel pure-MWEB maps: key = index (4 LE) || optional pubkey for origins.
+                    let mut key = (i as u32).to_le_bytes().to_vec();
+                    key.extend_from_slice(&key_data);
+                    rv.push(raw::Pair {
+                        key: raw::Key {
+                            type_value: field_ty,
+                            key,
+                        },
+                        value,
+                    });
+                }
+            }
+        }
+
+        if !self.mweb_outputs.is_empty() {
+            for (i, out) in self.mweb_outputs.iter().enumerate() {
+                for (field_ty, value) in out.to_pairs() {
+                    let mut key = (i as u32).to_le_bytes().to_vec();
+                    key.push(field_ty);
+                    rv.push(raw::Pair {
+                        key: raw::Key {
+                            type_value: MWEB_GLOBAL_OUTPUT_FIELD_TYPE,
+                            key,
+                        },
+                        value,
+                    });
+                }
+            }
+        }
+
         for (key, value) in self.proprietary.iter() {
             rv.push(raw::Pair { key: key.to_key(), value: value.clone() });
         }
@@ -77,6 +144,11 @@ impl Psbt {
         let mut unknowns: BTreeMap<raw::Key, Vec<u8>> = Default::default();
         let mut xpub_map: BTreeMap<Xpub, (Fingerprint, DerivationPath)> = Default::default();
         let mut proprietary: BTreeMap<raw::ProprietaryKey, Vec<u8>> = Default::default();
+        let mut mweb_tx_offset: Option<[u8; 32]> = None;
+        let mut mweb_stealth_offset: Option<[u8; 32]> = None;
+        let mut mweb_kernels: Vec<mweb::MwebKernel> = Vec::new();
+        let mut mweb_inputs: Vec<mweb::MwebInput> = Vec::new();
+        let mut mweb_outputs: Vec<mweb::MwebOutput> = Vec::new();
 
         loop {
             match raw::Pair::decode(&mut r) {
@@ -185,6 +257,58 @@ impl Psbt {
                             btree_map::Entry::Occupied(_) =>
                                 return Err(Error::DuplicateKey(pair.key)),
                         },
+                        MWEB_TX_OFFSET_TYPE if pair.key.key.is_empty() => {
+                            if mweb_tx_offset.is_some() {
+                                return Err(Error::DuplicateKey(pair.key));
+                            }
+                            if pair.value.len() != 32 {
+                                return Err(Error::InvalidKey(pair.key));
+                            }
+                            let mut off = [0u8; 32];
+                            off.copy_from_slice(&pair.value);
+                            mweb_tx_offset = Some(off);
+                        }
+                        MWEB_TX_STEALTH_OFFSET_TYPE if pair.key.key.is_empty() => {
+                            if mweb_stealth_offset.is_some() {
+                                return Err(Error::DuplicateKey(pair.key));
+                            }
+                            if pair.value.len() != 32 {
+                                return Err(Error::InvalidKey(pair.key));
+                            }
+                            let mut off = [0u8; 32];
+                            off.copy_from_slice(&pair.value);
+                            mweb_stealth_offset = Some(off);
+                        }
+                        MWEB_KERNEL_COUNT_TYPE if pair.key.key.is_empty() => {
+                            // Count is informational; kernel maps come from `0x93` pairs.
+                            if pair.value.len() != 4 {
+                                return Err(Error::InvalidKey(pair.key));
+                            }
+                        }
+                        MWEB_GLOBAL_KERNEL_FIELD_TYPE if pair.key.key.len() >= 5 => {
+                            let idx = u32::from_le_bytes(pair.key.key[..4].try_into().unwrap())
+                                as usize;
+                            let field_ty = pair.key.key[4];
+                            let key_data = &pair.key.key[5..];
+                            mweb::ensure_index(&mut mweb_kernels, idx);
+                            mweb_kernels[idx].apply_field(field_ty, key_data, &pair.value);
+                        }
+                        MWEB_GLOBAL_OUTPUT_FIELD_TYPE if pair.key.key.len() == 5 => {
+                            let idx = u32::from_le_bytes(pair.key.key[..4].try_into().unwrap())
+                                as usize;
+                            let field_ty = pair.key.key[4];
+                            mweb::ensure_index(&mut mweb_outputs, idx);
+                            mweb_outputs[idx].apply_field(field_ty, &pair.value);
+                        }
+                        ty if (MWEB_INPUT_FIELD_MIN..=MWEB_INPUT_FIELD_MAX).contains(&ty)
+                            && pair.key.key.len() >= 4 =>
+                        {
+                            let idx = u32::from_le_bytes(pair.key.key[..4].try_into().unwrap())
+                                as usize;
+                            let key_data = &pair.key.key[4..];
+                            mweb::ensure_index(&mut mweb_inputs, idx);
+                            mweb_inputs[idx].apply_kv_field(ty, key_data, &pair.value);
+                        }
                         _ => match unknowns.entry(pair.key) {
                             btree_map::Entry::Vacant(empty_key) => {
                                 empty_key.insert(pair.value);
@@ -206,6 +330,11 @@ impl Psbt {
                 xpub: xpub_map,
                 proprietary,
                 unknown: unknowns,
+                mweb_tx_offset,
+                mweb_stealth_offset,
+                mweb_kernels,
+                mweb_inputs,
+                mweb_outputs,
                 inputs: vec![],
                 outputs: vec![],
             })

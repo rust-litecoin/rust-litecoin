@@ -522,3 +522,111 @@ macro_rules! serde_struct_human_string_impl {
     )
 }
 pub(crate) use serde_struct_human_string_impl;
+
+/// Serde helpers for `Option<[u8; N]>` where `N > 32` (serde's built-in array support stops at 32).
+pub mod hex_array_opt {
+    #![allow(missing_docs)]
+
+    use hex::{DisplayHex, FromHex};
+
+    use crate::prelude::*;
+
+    macro_rules! define_opt_array {
+        ($mod_name:ident, $len:expr) => {
+            pub mod $mod_name {
+                use super::*;
+
+                pub fn serialize<S>(v: &Option<[u8; $len]>, s: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    match v {
+                        None => s.serialize_none(),
+                        Some(arr) if s.is_human_readable() => {
+                            s.serialize_some(&format!("{:x}", arr.as_hex()))
+                        }
+                        Some(arr) => s.serialize_some(arr.as_slice()),
+                    }
+                }
+
+                pub fn deserialize<'de, D>(d: D) -> Result<Option<[u8; $len]>, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                {
+                    struct Visitor;
+                    impl<'de> serde::de::Visitor<'de> for Visitor {
+                        type Value = Option<[u8; $len]>;
+                        fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                            write!(f, "optional hex or byte array of length {}", $len)
+                        }
+                        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                            Ok(None)
+                        }
+                        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                            Ok(None)
+                        }
+                        fn visit_some<D: serde::Deserializer<'de>>(
+                            self,
+                            d: D,
+                        ) -> Result<Self::Value, D::Error> {
+                            struct BytesVisitor;
+                            impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+                                type Value = [u8; $len];
+                                fn expecting(
+                                    &self,
+                                    f: &mut core::fmt::Formatter,
+                                ) -> core::fmt::Result {
+                                    write!(f, "hex string or {} bytes", $len)
+                                }
+                                fn visit_str<E: serde::de::Error>(
+                                    self,
+                                    v: &str,
+                                ) -> Result<Self::Value, E> {
+                                    let bytes = Vec::from_hex(v).map_err(E::custom)?;
+                                    if bytes.len() != $len {
+                                        return Err(E::invalid_length(bytes.len(), &self));
+                                    }
+                                    let mut arr = [0u8; $len];
+                                    arr.copy_from_slice(&bytes);
+                                    Ok(arr)
+                                }
+                                fn visit_bytes<E: serde::de::Error>(
+                                    self,
+                                    v: &[u8],
+                                ) -> Result<Self::Value, E> {
+                                    if v.len() != $len {
+                                        return Err(E::invalid_length(v.len(), &self));
+                                    }
+                                    let mut arr = [0u8; $len];
+                                    arr.copy_from_slice(v);
+                                    Ok(arr)
+                                }
+                                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                                    self,
+                                    mut seq: A,
+                                ) -> Result<Self::Value, A::Error> {
+                                    let mut arr = [0u8; $len];
+                                    for i in 0..$len {
+                                        arr[i] = seq
+                                            .next_element()?
+                                            .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                                    }
+                                    Ok(arr)
+                                }
+                            }
+                            if d.is_human_readable() {
+                                Ok(Some(d.deserialize_str(BytesVisitor)?))
+                            } else {
+                                Ok(Some(d.deserialize_byte_buf(BytesVisitor)?))
+                            }
+                        }
+                    }
+                    d.deserialize_option(Visitor)
+                }
+            }
+        };
+    }
+
+    define_opt_array!(n33, 33);
+    define_opt_array!(n64, 64);
+}

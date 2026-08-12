@@ -45,6 +45,8 @@ pub enum Error {
     /// PSBT v0 (BIP-174) has no field for MWEB data; including it would silently drop on
     /// round-trip. Strip `mw_tx` / `is_hog_ex` before constructing the PSBT.
     UnsupportedMwebOrHogEx,
+    /// Typed MWEB PSBT maps are present but incomplete for [`Psbt::extract_tx_with_mweb`].
+    IncompleteMwebMaps(&'static str),
     /// A PSBT must have an unsigned transaction.
     MustHaveUnsignedTx,
     /// Signals that there are no more key-value pairs in a key-value map.
@@ -128,6 +130,7 @@ impl fmt::Display for Error {
                 f.write_str("the unsigned transaction has script witnesses"),
             UnsupportedMwebOrHogEx =>
                 f.write_str("PSBT cannot carry Litecoin MWEB transaction body or HogEx flag"),
+            IncompleteMwebMaps(msg) => write!(f, "incomplete MWEB PSBT maps: {}", msg),
             MustHaveUnsignedTx =>
                 f.write_str("partially signed transactions must have an unsigned transaction"),
             NoMorePairs => f.write_str("no more key-value pairs for this psbt map"),
@@ -186,6 +189,7 @@ impl std::error::Error for Error {
             | UnsignedTxHasScriptSigs
             | UnsignedTxHasScriptWitnesses
             | UnsupportedMwebOrHogEx
+            | IncompleteMwebMaps(_)
             | MustHaveUnsignedTx
             | NoMorePairs
             | UnexpectedUnsignedTx { .. }

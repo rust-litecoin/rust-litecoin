@@ -31,8 +31,9 @@ Supports (or should support)
   (`ltcmweb` / `tmweb`)
 * Private keys (WIF prefix `0xB0` mainnet / `0xEF` testnet) and BIP32 derivation
 * Litecoin signed-message prefix (`\x19Litecoin Signed Message:\n`)
-* PSBT v0 de/serialization and all but the Input Finalizer role; PSBT explicitly rejects
-  Transactions carrying MWEB data, since BIP-174 has no field to round-trip it
+* PSBT v0 de/serialization and all but the Input Finalizer role; typed MWEB maps (`0x90+`)
+  round-trip offsets, kernels, and input/output fields — `mw_tx` is assembled only at
+  [`Psbt::extract_tx_with_mweb`], not on the unsigned transaction inside the PSBT
 
 ## Known limitations
 

@@ -13,6 +13,7 @@
 mod macros;
 mod error;
 mod map;
+pub mod mweb;
 pub mod raw;
 pub mod serialize;
 
@@ -37,6 +38,22 @@ use crate::{Amount, FeeRate, TapLeafHash, TapSighashType};
 pub use self::{
     map::{Input, Output, PsbtSighashType},
     error::Error,
+    mweb::{MwebInput, MwebKernel, MwebOutput},
+};
+pub use self::mweb::types::{
+    MWEB_ADDRESS_INDEX_TYPE, MWEB_COMMIT_OUTPUT_TYPE, MWEB_EXTRA_DATA_OUTPUT_TYPE,
+    MWEB_GLOBAL_KERNEL_FIELD_TYPE, MWEB_GLOBAL_OUTPUT_FIELD_TYPE, MWEB_INPUT_AMOUNT_TYPE,
+    MWEB_INPUT_EXTRA_DATA_TYPE, MWEB_INPUT_FEATURES_TYPE, MWEB_INPUT_PUBKEY_TYPE,
+    MWEB_INPUT_SIGNATURE_TYPE, MWEB_KERNEL_COUNT_TYPE, MWEB_KERNEL_EXCESS_COMMIT_TYPE,
+    MWEB_KERNEL_EXTRA_DATA_TYPE, MWEB_KERNEL_FEATURES_TYPE, MWEB_KERNEL_FEE_TYPE,
+    MWEB_KERNEL_LOCK_HEIGHT_TYPE, MWEB_KERNEL_PEGOUT_TYPE, MWEB_KERNEL_PEGIN_AMOUNT_TYPE,
+    MWEB_KERNEL_SIGNATURE_TYPE, MWEB_KERNEL_STEALTH_COMMIT_TYPE, MWEB_KEY_EXCHANGE_PUBKEY_TYPE,
+    MWEB_MASTER_SCAN_KEY_ORIGIN_TYPE, MWEB_MASTER_SPEND_KEY_ORIGIN_TYPE,
+    MWEB_OUTPUT_PUBKEY_OUTPUT_TYPE, MWEB_RANGE_PROOF_OUTPUT_TYPE,
+    MWEB_SENDER_PUBKEY_OUTPUT_TYPE, MWEB_SHARED_SECRET_TYPE, MWEB_SIGNATURE_OUTPUT_TYPE,
+    MWEB_SPENT_OUTPUT_COMMIT_TYPE, MWEB_SPENT_OUTPUT_ID_TYPE, MWEB_SPENT_OUTPUT_PUBKEY_TYPE,
+    MWEB_STANDARD_FIELDS_OUTPUT_TYPE, MWEB_STEALTH_ADDRESS_OUTPUT_TYPE,
+    MWEB_TX_OFFSET_TYPE, MWEB_TX_STEALTH_OFFSET_TYPE, MWEB_FEATURES_OUTPUT_TYPE,
 };
 
 /// A Partially Signed Transaction.
@@ -62,6 +79,17 @@ pub struct Psbt {
     pub inputs: Vec<Input>,
     /// The corresponding key-value map for each output in the unsigned transaction.
     pub outputs: Vec<Output>,
+
+    /// MWEB kernel offset (global `0x90`).
+    pub mweb_tx_offset: Option<[u8; 32]>,
+    /// MWEB stealth offset (global `0x91`).
+    pub mweb_stealth_offset: Option<[u8; 32]>,
+    /// MWEB kernel maps (global `0x92` count + `0x93` field pairs).
+    pub mweb_kernels: Vec<mweb::MwebKernel>,
+    /// Parallel MWEB input maps when `unsigned_tx` has fewer vin than MWEB inputs.
+    pub mweb_inputs: Vec<mweb::MwebInput>,
+    /// Parallel MWEB output maps when `unsigned_tx` has fewer vout than MWEB outputs.
+    pub mweb_outputs: Vec<mweb::MwebOutput>,
 }
 
 impl Psbt {
@@ -125,6 +153,11 @@ impl Psbt {
             version: 0,
             proprietary: Default::default(),
             unknown: Default::default(),
+            mweb_tx_offset: None,
+            mweb_stealth_offset: None,
+            mweb_kernels: Vec::new(),
+            mweb_inputs: Vec::new(),
+            mweb_outputs: Vec::new(),
         };
         psbt.unsigned_tx_checks()?;
         Ok(psbt)
@@ -221,6 +254,56 @@ impl Psbt {
         Ok(tx)
     }
 
+    /// Extract a network [`Transaction`] with `mw_tx` assembled from typed MWEB PSBT maps.
+    ///
+    /// The transparent portion is finalized from per-input `final_script_sig` / `final_script_witness`
+    /// like [`extract_tx_unchecked_fee_rate`]. MWEB body fields come from global offsets,
+    /// ([`Self::mweb_inputs`] / [`Self::mweb_outputs`]) when non-empty. If parallel input maps are
+    /// empty, per-slot [`Input::mweb`] is used only when at least one slot has `output_id` (pure
+    /// peg-ins keep `mweb_inputs` empty on purpose). Same rule for outputs via `commit`.
+    pub fn extract_tx_with_mweb(&self) -> Result<Transaction, Error> {
+        let kernel_offset = self
+            .mweb_tx_offset
+            .ok_or(Error::IncompleteMwebMaps("missing mweb_tx_offset"))?;
+        let stealth_offset = self
+            .mweb_stealth_offset
+            .ok_or(Error::IncompleteMwebMaps("missing mweb_stealth_offset"))?;
+
+        // Peg-in / hybrid txs often set parallel `mweb_outputs` + `mweb_kernels` with an empty
+        // `mweb_inputs` vec (no MWEB spends). Do **not** fall back to per-slot `Input::mweb` in
+        // that case — transparent vins carry default-empty maps and would fail assemble.
+        let inputs: Vec<MwebInput> = if !self.mweb_inputs.is_empty() {
+            self.mweb_inputs.clone()
+        } else if self.inputs.iter().any(|i| i.mweb.output_id.is_some()) {
+            self.inputs.iter().map(|i| i.mweb.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let outputs: Vec<MwebOutput> = if !self.mweb_outputs.is_empty() {
+            self.mweb_outputs.clone()
+        } else if self.outputs.iter().any(|o| o.mweb.commit.is_some()) {
+            self.outputs.iter().map(|o| o.mweb.clone()).collect()
+        } else {
+            Vec::new()
+        };
+
+        let mw = mweb::assemble_mw_tx(
+            kernel_offset,
+            stealth_offset,
+            &inputs,
+            &outputs,
+            &self.mweb_kernels,
+        )?;
+
+        let mut tx = self.unsigned_tx.clone();
+        for (vin, psbtin) in tx.input.iter_mut().zip(self.inputs.iter()) {
+            vin.script_sig = psbtin.final_script_sig.clone().unwrap_or_default();
+            vin.witness = psbtin.final_script_witness.clone().unwrap_or_default();
+        }
+        tx.mw_tx = Some(mw);
+        Ok(tx)
+    }
+
     /// Combines this [`Psbt`] with `other` PSBT as described by BIP 174.
     ///
     /// In accordance with BIP 174 this function is commutative i.e., `A.combine(B) == B.combine(A)`
@@ -275,6 +358,25 @@ impl Psbt {
 
         self.proprietary.extend(other.proprietary);
         self.unknown.extend(other.unknown);
+
+        if self.mweb_tx_offset.is_none() {
+            self.mweb_tx_offset = other.mweb_tx_offset;
+        }
+        if self.mweb_stealth_offset.is_none() {
+            self.mweb_stealth_offset = other.mweb_stealth_offset;
+        }
+        for (i, other_kernel) in other.mweb_kernels.into_iter().enumerate() {
+            mweb::ensure_index(&mut self.mweb_kernels, i);
+            self.mweb_kernels[i].combine(other_kernel);
+        }
+        for (i, other_inp) in other.mweb_inputs.into_iter().enumerate() {
+            mweb::ensure_index(&mut self.mweb_inputs, i);
+            self.mweb_inputs[i].combine(other_inp);
+        }
+        for (i, other_out) in other.mweb_outputs.into_iter().enumerate() {
+            mweb::ensure_index(&mut self.mweb_outputs, i);
+            self.mweb_outputs[i].combine(other_out);
+        }
 
         for (self_input, other_input) in self.inputs.iter_mut().zip(other.inputs.into_iter()) {
             self_input.combine(other_input);
@@ -1343,6 +1445,11 @@ mod tests {
                 ..Default::default()
             }],
             outputs: vec![],
+            mweb_tx_offset: None,
+            mweb_stealth_offset: None,
+            mweb_kernels: vec![],
+            mweb_inputs: vec![],
+            mweb_outputs: vec![],
         }
     }
 
@@ -1364,6 +1471,11 @@ mod tests {
 
             inputs: vec![],
             outputs: vec![],
+            mweb_tx_offset: None,
+            mweb_stealth_offset: None,
+            mweb_kernels: vec![],
+            mweb_inputs: vec![],
+            mweb_outputs: vec![],
         };
         assert_eq!(psbt.serialize_hex(), "70736274ff01000a0200000000000000000000");
     }
@@ -1519,6 +1631,11 @@ mod tests {
             unknown: Default::default(),
             inputs: vec![Input::default()],
             outputs: vec![Output::default(), Output::default()],
+            mweb_tx_offset: None,
+            mweb_stealth_offset: None,
+            mweb_kernels: vec![],
+            mweb_inputs: vec![],
+            mweb_outputs: vec![],
         };
 
         let actual: Psbt = Psbt::deserialize(&expected.serialize()).unwrap();
@@ -1653,6 +1770,11 @@ mod tests {
                     ..Default::default()
                 }
             ],
+            mweb_tx_offset: None,
+            mweb_stealth_offset: None,
+            mweb_kernels: vec![],
+            mweb_inputs: vec![],
+            mweb_outputs: vec![],
         };
         let encoded = serde_json::to_string(&psbt).unwrap();
         let decoded: Psbt = serde_json::from_str(&encoded).unwrap();
@@ -1823,6 +1945,11 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                mweb_tx_offset: None,
+                mweb_stealth_offset: None,
+                mweb_kernels: vec![],
+                mweb_inputs: vec![],
+                mweb_outputs: vec![],
             };
 
             let base16str = "70736274ff0100750200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf60000000000feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e1300000100fda5010100000000010289a3c71eab4d20e0371bbba4cc698fa295c9463afa2e397f8533ccb62f9567e50100000017160014be18d152a9b012039daf3da7de4f53349eecb985ffffffff86f8aa43a71dff1448893a530a7237ef6b4608bbb2dd2d0171e63aec6a4890b40100000017160014fe3e9ef1a745e974d902c4355943abcb34bd5353ffffffff0200c2eb0b000000001976a91485cff1097fd9e008bb34af709c62197b38978a4888ac72fef84e2c00000017a914339725ba21efd62ac753a9bcd067d6c7a6a39d05870247304402202712be22e0270f394f568311dc7ca9a68970b8025fdd3b240229f07f8a5f3a240220018b38d7dcd314e734c9276bd6fb40f673325bc4baa144c800d2f2f02db2765c012103d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f210502483045022100d12b852d85dcd961d2f5f4ab660654df6eedcc794c0c33ce5cc309ffb5fce58d022067338a8e0e1725c197fb1a88af59f51e44e4255b20167c8684031c05d1f2592a01210223b72beef0965d10be0778efecd61fcac6f79a4ea169393380734464f84f2ab300000000000000";
@@ -2159,6 +2286,11 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            mweb_tx_offset: None,
+            mweb_stealth_offset: None,
+            mweb_kernels: vec![],
+            mweb_inputs: vec![],
+            mweb_outputs: vec![],
         };
         unserialized.inputs[0].hash160_preimages = hash160_preimages;
         unserialized.inputs[0].sha256_preimages = sha256_preimages;
@@ -2359,6 +2491,11 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            mweb_tx_offset: None,
+            mweb_stealth_offset: None,
+            mweb_kernels: vec![],
+            mweb_inputs: vec![],
+            mweb_outputs: vec![],
         };
         assert_eq!(
             t.fee().expect("fee calculation"),
@@ -2385,6 +2522,226 @@ mod tests {
             Error::FeeOverflow => {}
             e => panic!("unexpected error: {:?}", e),
         }
+    }
+
+    #[test]
+    fn mweb_psbt_parallel_maps_roundtrip_and_extract() {
+        use crate::blockdata::transaction;
+        use secp256k1::{Secp256k1, SecretKey};
+
+        fn test_pubkey(seed: u8) -> Vec<u8> {
+            let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret");
+            sk.public_key(&Secp256k1::new()).serialize().to_vec()
+        }
+
+        let mut commit = [0u8; 33];
+        commit[0] = 2;
+        let mut excess = [0u8; 33];
+        excess[0] = 2;
+        excess[1] = 1;
+
+        let mweb_in = MwebInput {
+            output_id: Some([8u8; 32]),
+            commit: Some(commit),
+            output_pubkey: Some(test_pubkey(3)),
+            signature: Some(vec![0u8; 64]),
+            ..MwebInput::default()
+        };
+        let mut stealth = Vec::new();
+        stealth.extend(test_pubkey(10));
+        stealth.extend(test_pubkey(11));
+        let mweb_out = MwebOutput {
+            stealth_address: Some(stealth),
+            commit: Some(commit),
+            sender_pubkey: Some(test_pubkey(4)),
+            output_pubkey: Some(test_pubkey(5)),
+            range_proof: Some(vec![0u8; 675]),
+            signature: Some(vec![0u8; 64]),
+            ..MwebOutput::default()
+        };
+        let kernel = MwebKernel {
+            excess_commit: Some(excess),
+            fee: Some(5000),
+            features: Some(0),
+            signature: Some([0u8; 64]),
+            ..MwebKernel::default()
+        };
+
+        let psbt = Psbt {
+            unsigned_tx: Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![],
+                output: vec![],
+                mw_tx: None,
+                is_hog_ex: false,
+            },
+            version: 0,
+            xpub: Default::default(),
+            proprietary: Default::default(),
+            unknown: Default::default(),
+            inputs: vec![],
+            outputs: vec![],
+            mweb_tx_offset: Some([1u8; 32]),
+            mweb_stealth_offset: Some([2u8; 32]),
+            mweb_kernels: vec![kernel],
+            mweb_inputs: vec![mweb_in],
+            mweb_outputs: vec![mweb_out],
+        };
+
+        let bytes = psbt.serialize();
+        let decoded = Psbt::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.mweb_tx_offset, psbt.mweb_tx_offset);
+        assert_eq!(decoded.mweb_stealth_offset, psbt.mweb_stealth_offset);
+        assert_eq!(decoded.mweb_kernels.len(), 1);
+        assert_eq!(decoded.mweb_inputs.len(), 1);
+        assert_eq!(decoded.mweb_outputs.len(), 1);
+        assert_eq!(
+            decoded.mweb_outputs[0].stealth_address.as_ref().unwrap().len(),
+            66
+        );
+
+        let tx = decoded.extract_tx_with_mweb().unwrap();
+        assert!(tx.mw_tx.is_some());
+        assert_eq!(tx.mw_tx.as_ref().unwrap().kernel_offset, [1u8; 32]);
+        assert_eq!(tx.mw_tx.as_ref().unwrap().body.kernels[0].fee, Some(5000));
+    }
+
+    #[test]
+    fn mweb_psbt_key_origins_roundtrip_ltcd_shape() {
+        use crate::bip32::{ChildNumber, DerivationPath, Fingerprint};
+        use crate::blockdata::transaction;
+        use crate::psbt::serialize::Serialize;
+        use secp256k1::{Secp256k1, SecretKey};
+
+        let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let pk = sk.public_key(&Secp256k1::new());
+        let fp = Fingerprint::from([0xab, 0xcd, 0xef, 0x01]);
+        let scan_path: DerivationPath = vec![
+            ChildNumber::from_hardened_idx(0).unwrap(),
+            ChildNumber::from_hardened_idx(100).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        ]
+        .into();
+        let spend_path: DerivationPath = vec![
+            ChildNumber::from_hardened_idx(0).unwrap(),
+            ChildNumber::from_hardened_idx(100).unwrap(),
+            ChildNumber::from_hardened_idx(1).unwrap(),
+        ]
+        .into();
+
+        let mweb_in = MwebInput {
+            output_id: Some([3u8; 32]),
+            address_index: Some(0),
+            master_scan_key_origin: Some((pk, (fp, scan_path.clone()))),
+            master_spend_key_origin: Some((pk, (fp, spend_path.clone()))),
+            ..MwebInput::default()
+        };
+        mweb_in.validate_key_origins().unwrap();
+
+        let psbt = Psbt {
+            unsigned_tx: Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![],
+                output: vec![],
+                mw_tx: None,
+                is_hog_ex: false,
+            },
+            version: 0,
+            xpub: Default::default(),
+            proprietary: Default::default(),
+            unknown: Default::default(),
+            inputs: vec![],
+            outputs: vec![],
+            mweb_tx_offset: Some([1u8; 32]),
+            mweb_stealth_offset: Some([2u8; 32]),
+            mweb_kernels: vec![],
+            mweb_inputs: vec![mweb_in.clone()],
+            mweb_outputs: vec![],
+        };
+
+        let decoded = Psbt::deserialize(&psbt.serialize()).unwrap();
+        assert_eq!(decoded.mweb_inputs.len(), 1);
+        let got = &decoded.mweb_inputs[0];
+        assert_eq!(got.address_index, Some(0));
+        let (got_pk, got_ks) = got.master_scan_key_origin.as_ref().unwrap();
+        assert_eq!(*got_pk, pk);
+        assert_eq!(got_ks.0, fp);
+        assert_eq!(got_ks.1, scan_path);
+        // ltcd SerializeBIP32Derivation wire: fingerprint || LE path indexes
+        assert_eq!(got_ks.serialize(), (fp, scan_path).serialize());
+    }
+
+    /// Mirror ltcd `types.go` inventory + empty-vin pure-MWEB extract acceptance.
+    #[test]
+    fn mweb_psbt_ltcd_vector_inventory_and_empty_vin() {
+        use crate::blockdata::transaction;
+        use crate::psbt::mweb::types::*;
+
+        assert_eq!(MWEB_TX_OFFSET_TYPE, 0x90);
+        assert_eq!(MWEB_TX_STEALTH_OFFSET_TYPE, 0x91);
+        assert_eq!(MWEB_KERNEL_COUNT_TYPE, 0x92);
+        assert_eq!(MWEB_SPENT_OUTPUT_ID_TYPE, 0x90);
+        assert_eq!(MWEB_MASTER_SCAN_KEY_ORIGIN_TYPE, 0x9A);
+        assert_eq!(MWEB_MASTER_SPEND_KEY_ORIGIN_TYPE, 0x9B);
+        assert_eq!(MWEB_STEALTH_ADDRESS_OUTPUT_TYPE, 0x90);
+        assert_eq!(MWEB_KERNEL_PEGIN_AMOUNT_TYPE, 3);
+        assert_eq!(MWEB_KERNEL_PEGOUT_TYPE, 4);
+
+        // Pure MWEB: empty transparent vin/vout is valid (ltcd allows MWEB-only packets).
+        let mut commit = [0u8; 33];
+        commit[0] = 2;
+        let mut excess = [0u8; 33];
+        excess[0] = 2;
+        excess[1] = 9;
+        let sk = secp256k1::SecretKey::from_slice(&[5u8; 32]).unwrap();
+        let pk = sk.public_key(&secp256k1::Secp256k1::new()).serialize().to_vec();
+
+        let psbt = Psbt {
+            unsigned_tx: Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![],
+                output: vec![],
+                mw_tx: None,
+                is_hog_ex: false,
+            },
+            version: 0,
+            xpub: Default::default(),
+            proprietary: Default::default(),
+            unknown: Default::default(),
+            inputs: vec![],
+            outputs: vec![],
+            mweb_tx_offset: Some([4u8; 32]),
+            mweb_stealth_offset: Some([5u8; 32]),
+            mweb_kernels: vec![MwebKernel {
+                excess_commit: Some(excess),
+                fee: Some(100),
+                features: Some(0),
+                signature: Some([0u8; 64]),
+                ..MwebKernel::default()
+            }],
+            mweb_inputs: vec![MwebInput {
+                output_id: Some([6u8; 32]),
+                commit: Some(commit),
+                output_pubkey: Some(pk.clone()),
+                signature: Some(vec![0u8; 64]),
+                ..MwebInput::default()
+            }],
+            mweb_outputs: vec![MwebOutput {
+                commit: Some(commit),
+                sender_pubkey: Some(pk.clone()),
+                output_pubkey: Some(pk),
+                range_proof: Some(vec![0u8; 675]),
+                signature: Some(vec![0u8; 64]),
+                ..MwebOutput::default()
+            }],
+        };
+        let round = Psbt::deserialize(&psbt.serialize()).unwrap();
+        let tx = round.extract_tx_with_mweb().unwrap();
+        assert!(tx.input.is_empty());
+        assert!(tx.mw_tx.is_some());
     }
 
     #[test]
